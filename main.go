@@ -23,8 +23,9 @@ var (
 )
 
 type SFU struct {
-	peers       []peerConnection
+	peers       []*peerConnection
 	trackLocals map[string]*webrtc.TrackLocalStaticRTP
+	trackOwners map[string]*peerConnection
 	mu          sync.RWMutex
 }
 
@@ -43,7 +44,7 @@ type websocketMessage struct {
 	Data  string `json:"data"`
 }
 
-func (t *threadSafeWriter) WriteJSON(v any) error {
+func (t *threadSafeWriter) WriteJSON(v interface{}) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.conn.WriteJSON(v)
@@ -52,30 +53,33 @@ func (t *threadSafeWriter) WriteJSON(v any) error {
 func NewSFU() *SFU {
 	return &SFU{
 		trackLocals: make(map[string]*webrtc.TrackLocalStaticRTP),
+		trackOwners: make(map[string]*peerConnection),
 	}
 }
 
 func (s *SFU) addPeer(pc *webrtc.PeerConnection, conn *threadSafeWriter) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.peers = append(s.peers, peerConnection{pc, conn})
+	s.peers = append(s.peers, &peerConnection{pc, conn})
 }
 
-func (s *SFU) addTrack(t *webrtc.TrackRemote) (*webrtc.TrackLocalStaticRTP, error) {
+func (s *SFU) addTrack(peer *peerConnection, t *webrtc.TrackRemote) (*webrtc.TrackLocalStaticRTP, error) {
 	trackLocal, err := webrtc.NewTrackLocalStaticRTP(t.Codec().RTPCodecCapability, t.ID(), t.StreamID())
 	if err != nil {
 		return nil, fmt.Errorf("create track: %w", err)
 	}
 	s.mu.Lock()
 	s.trackLocals[t.ID()] = trackLocal
+	s.trackOwners[t.ID()] = peer
 	s.mu.Unlock()
-	logger.Infof("Added track: %v", trackLocal.ID())
+	logger.Infof("Added track %s from peer %p", trackLocal.ID(), peer)
 	return trackLocal, nil
 }
 
 func (s *SFU) removeTrack(track *webrtc.TrackLocalStaticRTP) {
 	s.mu.Lock()
 	delete(s.trackLocals, track.ID())
+	delete(s.trackOwners, track.ID())
 	s.mu.Unlock()
 }
 
@@ -93,11 +97,10 @@ func (s *SFU) signalPeers() error {
 	return nil
 }
 
-func (s *SFU) activePeers() []peerConnection {
+func (s *SFU) activePeers() []*peerConnection {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	var active []peerConnection
+	var active []*peerConnection
 	for _, peer := range s.peers {
 		if peer.pc.ConnectionState() != webrtc.PeerConnectionStateClosed {
 			active = append(active, peer)
@@ -107,63 +110,64 @@ func (s *SFU) activePeers() []peerConnection {
 	return active
 }
 
-func (s *SFU) updatePeerTracks(peer peerConnection) error {
+func (s *SFU) updatePeerTracks(peer *peerConnection) error {
 	senders := peer.pc.GetSenders()
 	for _, sender := range senders {
 		if sender.Track() == nil {
 			continue
 		}
-		if _, ok := s.trackLocals[sender.Track().ID()]; !ok {
+		trackID := sender.Track().ID()
+		s.mu.RLock()
+		_, ok := s.trackLocals[trackID]
+		s.mu.RUnlock()
+		if !ok {
 			if err := peer.pc.RemoveTrack(sender); err != nil {
 				return fmt.Errorf("remove track: %w", err)
 			}
 		}
 	}
 
-	receivers := peer.pc.GetReceivers()
-	existingTracks := make(map[string]bool, len(receivers))
-	for _, receiver := range receivers {
-		if track := receiver.Track(); track != nil {
-			existingTracks[track.ID()] = true
+	sendingTracks := make(map[string]bool)
+	for _, sender := range peer.pc.GetSenders() {
+		if track := sender.Track(); track != nil {
+			sendingTracks[track.ID()] = true
 		}
 	}
 
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for trackID, track := range s.trackLocals {
-		if !existingTracks[trackID] {
+		if s.trackOwners[trackID] != peer && !sendingTracks[trackID] {
 			if _, err := peer.pc.AddTrack(track); err != nil {
-				s.mu.RUnlock()
 				return fmt.Errorf("add track: %w", err)
 			}
 		}
 	}
-	s.mu.RUnlock()
 	return nil
 }
 
-func (s *SFU) sendOffer(peer peerConnection) error {
+func (s *SFU) sendOffer(peer *peerConnection) error {
 	offer, err := peer.pc.CreateOffer(nil)
 	if err != nil {
 		return fmt.Errorf("create offer: %w", err)
 	}
-
 	if err := peer.pc.SetLocalDescription(offer); err != nil {
 		return fmt.Errorf("set local description: %w", err)
 	}
-
 	offerData, err := json.Marshal(offer)
 	if err != nil {
 		return fmt.Errorf("marshal offer: %w", err)
 	}
-
-	logger.Infof("Sending offer: %v", string(offerData))
-	return peer.conn.WriteJSON(&websocketMessage{
+	logger.Infof("Sending offer: %s", string(offerData))
+	return peer.conn.WriteJSON(websocketMessage{
 		Event: "offer",
 		Data:  string(offerData),
 	})
 }
 
 func (s *SFU) dispatchKeyFrames() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, peer := range s.peers {
 		for _, receiver := range peer.pc.GetReceivers() {
 			if track := receiver.Track(); track != nil && track.Kind() == webrtc.RTPCodecTypeVideo {
@@ -176,9 +180,7 @@ func (s *SFU) dispatchKeyFrames() {
 }
 
 func (s *SFU) handleWebSocket(w http.ResponseWriter, r *http.Request) error {
-	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
-	}
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return fmt.Errorf("upgrade websocket: %w", err)
@@ -209,7 +211,6 @@ func (s *SFU) handleWebSocket(w http.ResponseWriter, r *http.Request) error {
 	}, webrtc.RTPCodecTypeVideo); err != nil {
 		return fmt.Errorf("register video codec: %w", err)
 	}
-
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(&mediaEngine))
 	pc, err := api.NewPeerConnection(config)
 	if err != nil {
@@ -226,6 +227,7 @@ func (s *SFU) handleWebSocket(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	writer := &threadSafeWriter{conn: conn}
+	peer := &peerConnection{pc, writer}
 	s.addPeer(pc, writer)
 
 	pc.OnICECandidate(func(i *webrtc.ICECandidate) {
@@ -237,7 +239,7 @@ func (s *SFU) handleWebSocket(w http.ResponseWriter, r *http.Request) error {
 			logger.Errorf("marshal candidate: %v", err)
 			return
 		}
-		if err := writer.WriteJSON(&websocketMessage{
+		if err := writer.WriteJSON(websocketMessage{
 			Event: "candidate",
 			Data:  string(candidateData),
 		}); err != nil {
@@ -246,15 +248,17 @@ func (s *SFU) handleWebSocket(w http.ResponseWriter, r *http.Request) error {
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
-			if state == webrtc.PeerConnectionStateClosed {
-				s.signalPeers()
+		if state == webrtc.PeerConnectionStateClosed {
+			err := s.signalPeers()
+			if err != nil {
+				logger.Errorf("error transfer signals in peer %s", err.Error())
+				return
 			}
 		}
 	})
 
 	pc.OnTrack(func(t *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		trackLocal, err := s.addTrack(t)
+		trackLocal, err := s.addTrack(peer, t)
 		if err != nil {
 			logger.Errorf("add track: %v", err)
 			return
@@ -265,7 +269,6 @@ func (s *SFU) handleWebSocket(w http.ResponseWriter, r *http.Request) error {
 		if t.Kind() == webrtc.RTPCodecTypeAudio {
 			bufferSize = 500
 		}
-
 		buf := make([]byte, bufferSize)
 		for {
 			n, _, err := t.Read(buf)
@@ -291,12 +294,12 @@ func (s *SFU) handleWebSocket(w http.ResponseWriter, r *http.Request) error {
 		logger.Errorf("signal peers: %v", err)
 	}
 
-	var msg websocketMessage
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			return nil
 		}
+		var msg websocketMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
 			logger.Errorf("unmarshal message: %v", err)
 			continue
@@ -328,20 +331,17 @@ func (s *SFU) handleWebSocket(w http.ResponseWriter, r *http.Request) error {
 
 func main() {
 	flag.Parse()
-
 	sfu := NewSFU()
 	http.HandleFunc("/websocket", func(w http.ResponseWriter, r *http.Request) {
 		if err := sfu.handleWebSocket(w, r); err != nil {
 			logger.Errorf("handle websocket: %v", err)
 		}
 	})
-
 	go func() {
-		for range time.Tick(time.Second * 3) {
+		for range time.Tick(3 * time.Second) {
 			sfu.dispatchKeyFrames()
 		}
 	}()
-
 	if err := http.ListenAndServe(*addr, nil); err != nil {
 		logger.Errorf("start server: %v", err)
 	}
