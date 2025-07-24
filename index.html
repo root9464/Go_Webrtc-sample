@@ -2,100 +2,186 @@
 <html>
   <head>
     <meta charset="utf-8" />
+    <title>WebRTC Video Chat</title>
+    <script src="https://cdn.tailwindcss.com"></script>
   </head>
-  <body>
-    <h3>Local Video</h3>
-    <video id="localVideo" width="160" height="120" autoplay muted></video>
-    <h3>Remote Video</h3>
-    <div id="remoteVideos"></div>
-    <h3>Logs</h3>
-    <div id="logs"></div>
+  <body class="bg-gray-100 font-sans">
+    <div class="container mx-auto p-4 max-w-4xl">
+      <h1 class="text-2xl font-bold text-gray-800 mb-4">WebRTC Video Chat</h1>
+
+      <div class="mb-6">
+        <h3 class="text-lg font-semibold text-gray-700 mb-2">Local Video</h3>
+        <div class="relative bg-gray-200 rounded-lg overflow-hidden">
+          <video id="localVideo" width="320" height="240" autoplay muted class="w-full"></video>
+          <div id="localVideoPlaceholder" class="absolute inset-0 flex items-center justify-center bg-gray-300 text-gray-600">Camera is off</div>
+        </div>
+        <button
+          id="toggleCamera"
+          class="mt-2 px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-400">
+          Enable Camera
+        </button>
+      </div>
+
+      <div class="mb-6">
+        <h3 class="text-lg font-semibold text-gray-700 mb-2">Remote Videos</h3>
+        <div id="remoteVideos" class="grid grid-cols-1 sm:grid-cols-2 gap-4"></div>
+      </div>
+
+      <div>
+        <h3 class="text-lg font-semibold text-gray-700 mb-2">Logs</h3>
+        <div id="logs" class="bg-white p-4 rounded-lg shadow h-40 overflow-y-auto text-sm text-gray-600"></div>
+      </div>
+    </div>
+
     <script>
       const wsUrl = `ws://localhost:8080/websocket`;
-      async function startConnection() {
-        const pc = new RTCPeerConnection();
-        const remoteVideos = document.getElementById('remoteVideos');
-        const localVideo = document.getElementById('localVideo');
-        let stream = null;
-        try {
-          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-          localVideo.srcObject = stream;
-          stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-        } catch (e) {
-          console.warn('Failed to get media devices: ', e);
-        }
+      let pc = null;
+      let stream = null;
+      let isCameraOn = false;
+      const localVideo = document.getElementById('localVideo');
+      const remoteVideos = document.getElementById('remoteVideos');
+      const toggleCameraBtn = document.getElementById('toggleCamera');
+      const logs = document.getElementById('logs');
+      const localVideoPlaceholder = document.getElementById('localVideoPlaceholder');
+
+      function logMessage(message) {
+        const logEntry = document.createElement('div');
+        logEntry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+        logs.appendChild(logEntry);
+        logs.scrollTop = logs.scrollHeight;
+      }
+
+      function initializeWebRTC() {
+        pc = new RTCPeerConnection({
+          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+        });
+
         pc.ontrack = function (event) {
           if (event.track.kind === 'audio') return;
-          let el = document.createElement(event.track.kind);
+          const el = document.createElement('video');
           el.srcObject = event.streams[0];
           el.autoplay = true;
           el.controls = true;
+          el.className = 'w-full rounded-lg';
           remoteVideos.appendChild(el);
-          event.track.onmute = function () {
-            el.play();
-          };
+          logMessage(`Received remote ${event.track.kind} track`);
+          event.track.onmute = () => el.play();
           event.streams[0].onremovetrack = ({ track }) => {
             if (el.parentNode) {
               el.parentNode.removeChild(el);
+              logMessage('Remote track removed');
             }
           };
         };
+
         const ws = new WebSocket(wsUrl);
-        ws.onopen = () => {
-          console.log('WebSocket opened');
+        ws.onopen = () => logMessage('WebSocket opened');
+        ws.onclose = () => {
+          logMessage('WebSocket closed');
+          alert('WebSocket connection closed');
         };
+        ws.onerror = (evt) => logMessage('WebSocket error: ' + evt);
+
         pc.onicecandidate = (e) => {
           if (e.candidate) {
             ws.send(JSON.stringify({ event: 'candidate', data: JSON.stringify(e.candidate) }));
+            logMessage('Sent ICE candidate');
           }
         };
-        ws.onclose = function () {
-          alert('WebSocket closed');
-        };
-        ws.onerror = function (evt) {
-          console.log('WebSocket error: ', evt);
-        };
-        ws.onmessage = async function (evt) {
+
+        ws.onmessage = async (evt) => {
           let msg;
           try {
             msg = JSON.parse(evt.data);
           } catch (e) {
-            console.log('Failed to parse message:', e);
+            logMessage('Failed to parse message: ' + e);
             return;
           }
-          if (!msg) return console.log('Empty message');
+          if (!msg) {
+            logMessage('Empty message received');
+            return;
+          }
           switch (msg.event) {
             case 'offer':
               let offer;
               try {
                 offer = JSON.parse(msg.data);
               } catch (e) {
-                console.log('Failed to parse offer:', e);
+                logMessage('Failed to parse offer: ' + e);
                 return;
               }
-              if (!offer) return console.log('Empty offer');
+              if (!offer) {
+                logMessage('Empty offer received');
+                return;
+              }
               await pc.setRemoteDescription(offer);
               const answer = await pc.createAnswer();
               await pc.setLocalDescription(answer);
               ws.send(JSON.stringify({ event: 'answer', data: JSON.stringify(answer) }));
+              logMessage('Sent answer');
               break;
             case 'candidate':
               let candidate;
               try {
                 candidate = JSON.parse(msg.data);
               } catch (e) {
-                console.log('Failed to parse candidate:', e);
+                logMessage('Failed to parse candidate: ' + e);
                 return;
               }
-              if (!candidate) return console.log('Empty candidate');
+              if (!candidate) {
+                logMessage('Empty candidate received');
+                return;
+              }
               await pc.addIceCandidate(candidate);
+              logMessage('Added ICE candidate');
               break;
             default:
-              console.log('Unknown event:', msg.event);
+              logMessage('Unknown event: ' + msg.event);
           }
         };
       }
-      startConnection();
+
+      toggleCameraBtn.addEventListener('click', async () => {
+        if (isCameraOn) {
+          if (stream) {
+            stream.getTracks().forEach((track) => {
+              track.stop();
+              const sender = pc.getSenders().find((s) => s.track === track);
+              if (sender) pc.removeTrack(sender);
+            });
+            stream = null;
+            localVideo.srcObject = null;
+            logMessage('Camera stopped');
+          }
+          localVideo.classList.add('hidden');
+          localVideoPlaceholder.classList.remove('hidden');
+          toggleCameraBtn.textContent = 'Enable Camera';
+          toggleCameraBtn.classList.remove('bg-red-500', 'hover:bg-red-600');
+          toggleCameraBtn.classList.add('bg-blue-500', 'hover:bg-blue-600');
+          isCameraOn = false;
+        } else {
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+            localVideo.srcObject = stream;
+            localVideo.classList.remove('hidden');
+            localVideoPlaceholder.classList.add('hidden');
+            stream.getTracks().forEach((track) => {
+              pc.addTrack(track, stream);
+              logMessage(`Added ${track.kind} track`);
+            });
+            toggleCameraBtn.textContent = 'Disable Camera';
+            toggleCameraBtn.classList.remove('bg-blue-500', 'hover:bg-blue-600');
+            toggleCameraBtn.classList.add('bg-red-500', 'hover:bg-red-600');
+            isCameraOn = true;
+            logMessage('Camera started');
+          } catch (e) {
+            logMessage('Failed to get media devices: ' + e);
+            alert('Failed to access camera: ' + e.message);
+          }
+        }
+      });
+
+      initializeWebRTC();
     </script>
   </body>
 </html>
