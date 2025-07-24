@@ -3,98 +3,99 @@
   <head>
     <meta charset="utf-8" />
   </head>
-
   <body>
     <h3>Local Video</h3>
-    <video id="localVideo" width="160" height="120" autoplay muted></video> <br />
-
+    <video id="localVideo" width="160" height="120" autoplay muted></video>
     <h3>Remote Video</h3>
     <div id="remoteVideos"></div>
-    <br />
-
     <h3>Logs</h3>
     <div id="logs"></div>
-  </body>
-
-  <script>
-    async function startConnection() {
-      const pc = new RTCPeerConnection();
-      const remoteVideos = document.getElementById('remoteVideos');
-      const localVideo = document.getElementById('localVideo');
-      let stream = null;
-
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        localVideo.srcObject = stream;
-        stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-      } catch (e) {
-        console.warn('Не удалось получить устройства: ', e);
-      }
-
-      pc.ontrack = function (event) {
-        if (event.track.kind === 'audio') return;
-
-        let el = document.createElement(event.track.kind);
-        el.srcObject = event.streams[0];
-        el.autoplay = true;
-        el.controls = true;
-        remoteVideos.appendChild(el);
-
-        event.track.onmute = function () {
-          el.play();
+    <script>
+      const wsUrl = `ws://localhost:8080/websocket`;
+      async function startConnection() {
+        const pc = new RTCPeerConnection();
+        const remoteVideos = document.getElementById('remoteVideos');
+        const localVideo = document.getElementById('localVideo');
+        let stream = null;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+          localVideo.srcObject = stream;
+          stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+        } catch (e) {
+          console.warn('Failed to get media devices: ', e);
+        }
+        pc.ontrack = function (event) {
+          if (event.track.kind === 'audio') return;
+          let el = document.createElement(event.track.kind);
+          el.srcObject = event.streams[0];
+          el.autoplay = true;
+          el.controls = true;
+          remoteVideos.appendChild(el);
+          event.track.onmute = function () {
+            el.play();
+          };
+          event.streams[0].onremovetrack = ({ track }) => {
+            if (el.parentNode) {
+              el.parentNode.removeChild(el);
+            }
+          };
         };
-
-        event.streams[0].onremovetrack = ({ track }) => {
-          if (el.parentNode) {
-            el.parentNode.removeChild(el);
+        const ws = new WebSocket(wsUrl);
+        ws.onopen = () => {
+          console.log('WebSocket opened');
+        };
+        pc.onicecandidate = (e) => {
+          if (e.candidate) {
+            ws.send(JSON.stringify({ event: 'candidate', data: JSON.stringify(e.candidate) }));
           }
         };
-      };
-
-      const ws = new WebSocket('{{.}}');
-
-      ws.onopen = () => {
-        console.log('WebSocket открыт');
-      };
-
-      pc.onicecandidate = (e) => {
-        if (e.candidate) {
-          ws.send(JSON.stringify({ event: 'candidate', data: JSON.stringify(e.candidate) }));
-        }
-      };
-
-      ws.onclose = function () {
-        window.alert('WebSocket закрыт');
-      };
-
-      ws.onerror = function (evt) {
-        console.log('WebSocket ошибка: ', evt);
-      };
-
-      ws.onmessage = async function (evt) {
-        let msg = JSON.parse(evt.data);
-        if (!msg) return console.log('Ошибка разбора сообщения');
-
-        switch (msg.event) {
-          case 'offer':
-            let offer = JSON.parse(msg.data);
-            if (!offer) return console.log('Ошибка разбора offer');
-
-            await pc.setRemoteDescription(offer);
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            ws.send(JSON.stringify({ event: 'answer', data: JSON.stringify(answer) }));
-            break;
-
-          case 'candidate':
-            let candidate = JSON.parse(msg.data);
-            if (!candidate) return console.log('Ошибка разбора candidate');
-            pc.addIceCandidate(candidate);
-            break;
-        }
-      };
-    }
-
-    startConnection();
-  </script>
+        ws.onclose = function () {
+          alert('WebSocket closed');
+        };
+        ws.onerror = function (evt) {
+          console.log('WebSocket error: ', evt);
+        };
+        ws.onmessage = async function (evt) {
+          let msg;
+          try {
+            msg = JSON.parse(evt.data);
+          } catch (e) {
+            console.log('Failed to parse message:', e);
+            return;
+          }
+          if (!msg) return console.log('Empty message');
+          switch (msg.event) {
+            case 'offer':
+              let offer;
+              try {
+                offer = JSON.parse(msg.data);
+              } catch (e) {
+                console.log('Failed to parse offer:', e);
+                return;
+              }
+              if (!offer) return console.log('Empty offer');
+              await pc.setRemoteDescription(offer);
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              ws.send(JSON.stringify({ event: 'answer', data: JSON.stringify(answer) }));
+              break;
+            case 'candidate':
+              let candidate;
+              try {
+                candidate = JSON.parse(msg.data);
+              } catch (e) {
+                console.log('Failed to parse candidate:', e);
+                return;
+              }
+              if (!candidate) return console.log('Empty candidate');
+              await pc.addIceCandidate(candidate);
+              break;
+            default:
+              console.log('Unknown event:', msg.event);
+          }
+        };
+      }
+      startConnection();
+    </script>
+  </body>
 </html>
