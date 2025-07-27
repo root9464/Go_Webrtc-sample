@@ -12,7 +12,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/pion/logging"
 	"github.com/pion/rtcp"
-	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -86,20 +85,6 @@ func (s *SFU) removeTrack(track *webrtc.TrackLocalStaticRTP) {
 	s.mu.Unlock()
 }
 
-func (s *SFU) signalPeers() error {
-	peers := s.activePeers()
-	for _, peer := range peers {
-		if err := s.updatePeerTracks(peer); err != nil {
-			return err
-		}
-		if err := s.sendOffer(peer); err != nil {
-			return err
-		}
-	}
-	s.dispatchKeyFrames()
-	return nil
-}
-
 func (s *SFU) activePeers() []*peerConnection {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -149,25 +134,6 @@ func (s *SFU) updatePeerTracks(peer *peerConnection) error {
 	return nil
 }
 
-func (s *SFU) sendOffer(peer *peerConnection) error {
-	offer, err := peer.pc.CreateOffer(nil)
-	if err != nil {
-		return fmt.Errorf("create offer: %w", err)
-	}
-	if err := peer.pc.SetLocalDescription(offer); err != nil {
-		return fmt.Errorf("set local description: %w", err)
-	}
-	offerData, err := json.Marshal(offer)
-	if err != nil {
-		return fmt.Errorf("marshal offer: %w", err)
-	}
-	logger.Infof("Sending offer: %s", string(offerData))
-	return peer.conn.WriteJSON(websocketMessage{
-		Event: "offer",
-		Data:  string(offerData),
-	})
-}
-
 func (s *SFU) dispatchKeyFrames() {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -182,8 +148,83 @@ func (s *SFU) dispatchKeyFrames() {
 	}
 }
 
+func (s *SFU) signalPeers() error {
+	peers := s.activePeers()
+	for _, peer := range peers {
+		if peer.pc.SignalingState() == webrtc.SignalingStateHaveLocalOffer {
+			continue // Пропускаем если уже есть локальное offer
+		}
+
+		if err := s.updatePeerTracks(peer); err != nil {
+			return err
+		}
+		if err := s.sendOffer(peer); err != nil {
+			return err
+		}
+	}
+	s.dispatchKeyFrames()
+	return nil
+}
+
+func (s *SFU) sendOffer(peer *peerConnection) error {
+	if peer.pc.SignalingState() != webrtc.SignalingStateStable {
+		return nil
+	}
+
+	offer, err := peer.pc.CreateOffer(nil)
+	if err != nil {
+		return fmt.Errorf("create offer: %w", err)
+	}
+
+	err = peer.pc.SetLocalDescription(offer)
+	if err != nil {
+		return fmt.Errorf("set local description: %w", err)
+	}
+
+	offerData, err := json.Marshal(offer)
+	if err != nil {
+		return fmt.Errorf("marshal offer: %w", err)
+	}
+
+	return peer.conn.WriteJSON(websocketMessage{
+		Event: "offer",
+		Data:  string(offerData),
+	})
+}
+
 func (s *SFU) handleWebSocket(c *fiber.Ctx) error {
-	return socketio.New(func(conn *socketio.Websocket) {
+	socketio.On(socketio.EventMessage, func(ep *socketio.EventPayload) {
+		var msg websocketMessage
+		if err := json.Unmarshal(ep.Data, &msg); err != nil {
+			logger.Errorf("unmarshal message: %v", err)
+			return
+		}
+
+		pc := ep.Kws.GetAttribute("pc").(*webrtc.PeerConnection)
+
+		switch msg.Event {
+		case "candidate":
+			var candidate webrtc.ICECandidateInit
+			if err := json.Unmarshal([]byte(msg.Data), &candidate); err != nil {
+				logger.Errorf("unmarshal candidate: %v", err)
+				return
+			}
+			if err := pc.AddICECandidate(candidate); err != nil {
+				logger.Errorf("add ICE candidate: %v", err)
+			}
+		case "answer":
+			var answer webrtc.SessionDescription
+			if err := json.Unmarshal([]byte(msg.Data), &answer); err != nil {
+				logger.Errorf("unmarshal answer: %v", err)
+				return
+			}
+			if err := pc.SetRemoteDescription(answer); err != nil {
+				logger.Errorf("set remote description: %v", err)
+			}
+		}
+	})
+
+	return socketio.New(func(kws *socketio.Websocket) {
 		config := webrtc.Configuration{
 			ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
 		}
@@ -219,19 +260,12 @@ func (s *SFU) handleWebSocket(c *fiber.Ctx) error {
 			logger.Errorf("create peer connection: %v", err)
 			return
 		}
-		defer pc.Close()
 
-		for _, typ := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
-			if _, err := pc.AddTransceiverFromKind(typ, webrtc.RTPTransceiverInit{
-				Direction: webrtc.RTPTransceiverDirectionRecvonly,
-			}); err != nil {
-				logger.Errorf("add transceiver: %v", err)
-				return
-			}
-		}
+		// Сохраняем PeerConnection в атрибутах WebSocket
+		kws.SetAttribute("pc", pc)
 
-		writer := &threadSafeWriter{conn: conn.Conn}
-		peer := &peerConnection{pc, writer}
+		writer := &threadSafeWriter{conn: kws.Conn}
+		peer := &peerConnection{pc: pc, conn: writer}
 		s.addPeer(pc, writer)
 
 		pc.OnICECandidate(func(i *webrtc.ICECandidate) {
@@ -243,18 +277,18 @@ func (s *SFU) handleWebSocket(c *fiber.Ctx) error {
 				logger.Errorf("marshal candidate: %v", err)
 				return
 			}
-			if err := writer.WriteJSON(websocketMessage{
-				Event: "candidate",
-				Data:  string(candidateData),
-			}); err != nil {
-				logger.Errorf("send candidate: %v", err)
-			}
+
+			// Правильный вызов Emit с указанием типа сообщения (TextMessage = 1)
+			kws.Emit(candidateData, socketio.TextMessage)
+
+			logger.Debugf("Sent ICE candidate to peer %s", kws.UUID)
 		})
 
 		pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+			logger.Infof("Peer connection state changed: %s", state.String())
 			if state == webrtc.PeerConnectionStateClosed {
 				if err := s.signalPeers(); err != nil {
-					logger.Errorf("error transfer signals in peer %s", err.Error())
+					logger.Errorf("error signaling peers: %v", err)
 				}
 			}
 		})
@@ -267,69 +301,43 @@ func (s *SFU) handleWebSocket(c *fiber.Ctx) error {
 			}
 			defer s.removeTrack(trackLocal)
 
-			bufferSize := 1500
-			if t.Kind() == webrtc.RTPCodecTypeAudio {
-				bufferSize = 500
+			logger.Infof("Track received: %s, kind: %s", t.ID(), t.Kind().String())
+
+			// Сигнализируем другим пирам о новом треке
+			if err := s.signalPeers(); err != nil {
+				logger.Errorf("error signaling peers: %v", err)
 			}
 
-			buf := make([]byte, bufferSize)
+			buf := make([]byte, 1500)
 			for {
 				n, _, err := t.Read(buf)
 				if err != nil {
+					logger.Errorf("read track: %v", err)
 					return
 				}
-				var pkt rtp.Packet
-				if err := pkt.Unmarshal(buf[:n]); err != nil {
-					logger.Errorf("unmarshal RTP packet: %v", err)
-					return
-				}
-				if t.Kind() != webrtc.RTPCodecTypeAudio {
-					pkt.Extension = false
-					pkt.Extensions = nil
-				}
-				if err := trackLocal.WriteRTP(&pkt); err != nil {
+
+				if _, err := trackLocal.Write(buf[:n]); err != nil {
+					logger.Errorf("write track: %v", err)
 					return
 				}
 			}
 		})
 
-		if err := s.signalPeers(); err != nil {
-			logger.Errorf("signal peers: %v", err)
-		}
-
-		for {
-			_, data, err := conn.Conn.ReadMessage()
-			if err != nil {
+		// Добавляем трансceiver'ы
+		for _, typ := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
+			if _, err := pc.AddTransceiverFromKind(typ, webrtc.RTPTransceiverInit{
+				Direction: webrtc.RTPTransceiverDirectionRecvonly,
+			}); err != nil {
+				logger.Errorf("add transceiver: %v", err)
 				return
 			}
-			var msg websocketMessage
-			if err := json.Unmarshal(data, &msg); err != nil {
-				logger.Errorf("unmarshal message: %v", err)
-				continue
-			}
-			switch msg.Event {
-			case "candidate":
-				var candidate webrtc.ICECandidateInit
-				if err := json.Unmarshal([]byte(msg.Data), &candidate); err != nil {
-					logger.Errorf("unmarshal candidate: %v", err)
-					continue
-				}
-				if err := pc.AddICECandidate(candidate); err != nil {
-					logger.Errorf("add ICE candidate: %v", err)
-				}
-			case "answer":
-				var answer webrtc.SessionDescription
-				if err := json.Unmarshal([]byte(msg.Data), &answer); err != nil {
-					logger.Errorf("unmarshal answer: %v", err)
-					continue
-				}
-				if err := pc.SetRemoteDescription(answer); err != nil {
-					logger.Errorf("set remote description: %v", err)
-				}
-			default:
-				logger.Errorf("unknown message event: %s", msg.Event)
-			}
 		}
+
+		// Отправляем начальный offer
+		if err := s.signalPeers(); err != nil {
+			logger.Errorf("initial signal peers: %v", err)
+		}
+
 	})(c)
 }
 
