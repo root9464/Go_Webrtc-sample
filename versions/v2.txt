@@ -10,7 +10,7 @@ import (
 	"github.com/gofiber/contrib/socketio"
 	"github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/log"
+	"github.com/pion/logging"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -22,6 +22,7 @@ var (
 	listLock      sync.RWMutex
 	connections   []connection
 	trackLocals   map[string]*webrtc.TrackLocalStaticRTP
+	log           = logging.NewDefaultLoggerFactory().NewLogger("sfu-ws")
 )
 
 type websocketMessage struct {
@@ -86,22 +87,7 @@ func main() {
 	})
 
 	app.Get("/websocket", socketio.New(func(kws *socketio.Websocket) {
-		mediaEngine := &webrtc.MediaEngine{}
-		if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
-			log.Errorf("Failed to register codecs: %v", err)
-			return
-		}
-
-		settingEngine := webrtc.SettingEngine{}
-
-		api := webrtc.NewAPI(
-			webrtc.WithMediaEngine(mediaEngine),
-			webrtc.WithSettingEngine(settingEngine),
-		)
-
-		pc, err := api.NewPeerConnection(webrtc.Configuration{
-			SDPSemantics: webrtc.SDPSemanticsUnifiedPlanWithFallback,
-		})
+		pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 		if err != nil {
 			log.Errorf("Failed to create PeerConnection: %v", err)
 			return
@@ -251,17 +237,15 @@ func addTrack(t *webrtc.TrackRemote) *webrtc.TrackLocalStaticRTP {
 		signalPeerConnections()
 	}()
 
+	if existingTrack, ok := trackLocals[t.ID()]; ok {
+		return existingTrack
+	}
+
 	trackLocal, err := webrtc.NewTrackLocalStaticRTP(t.Codec().RTPCodecCapability, t.ID(), t.StreamID())
 	if err != nil {
 		log.Errorf("Failed to create track local: %v", err)
 		return nil
 	}
-
-	// Удаляем старый трек, если есть
-	if oldTrack, exists := trackLocals[t.ID()]; exists {
-		removeTrack(oldTrack)
-	}
-
 	trackLocals[t.ID()] = trackLocal
 	return trackLocal
 }
@@ -312,12 +296,8 @@ func signalPeerConnections() {
 
 			for trackID := range trackLocals {
 				if _, ok := existingSenders[trackID]; !ok {
-					_, err := connections[i].pc.AddTransceiverFromTrack(trackLocals[trackID], webrtc.RTPTransceiverInit{
-						Direction: webrtc.RTPTransceiverDirectionSendonly,
-					})
-					if err != nil {
-						log.Errorf("Failed to add track %s to connection %s: %v", trackID, connections[i].kws.GetUUID(), err)
-						continue
+					if _, err := connections[i].pc.AddTrack(trackLocals[trackID]); err != nil {
+						return true
 					}
 				}
 			}

@@ -1,187 +1,300 @@
 <!DOCTYPE html>
-<html>
+<html lang="ru">
   <head>
     <meta charset="utf-8" />
     <title>WebRTC Video Chat</title>
     <script src="https://cdn.tailwindcss.com"></script>
   </head>
-  <body class="bg-gray-100 font-sans">
-    <div class="container mx-auto p-4 max-w-4xl">
-      <h1 class="text-2xl font-bold text-gray-800 mb-4">WebRTC Video Chat</h1>
+  <body class="bg-gray-900 text-gray-200 min-h-screen p-6">
+    <div class="max-w-6xl mx-auto">
+      <h1 class="text-3xl font-bold mb-8 text-center text-blue-400">WebRTC Video Chat</h1>
 
-      <div class="mb-6">
-        <h3 class="text-lg font-semibold text-gray-700 mb-2">Local Video</h3>
-        <div class="relative bg-gray-200 rounded-lg overflow-hidden">
-          <video id="localVideo" width="320" height="240" autoplay muted class="w-full"></video>
-          <div id="localVideoPlaceholder" class="absolute inset-0 flex items-center justify-center bg-gray-300 text-gray-600">Camera is off</div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
+        <div class="bg-gray-800 rounded-lg p-4 shadow-lg">
+          <h3 class="text-xl font-semibold mb-4 text-blue-300">Ваше видео</h3>
+          <video id="localVideo" class="w-full h-auto rounded-md bg-gray-700" width="160" height="120" autoplay muted></video>
         </div>
-        <button
-          id="toggleCamera"
-          class="mt-2 px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-400">
-          Enable Camera
-        </button>
+
+        <div class="bg-gray-800 rounded-lg p-4 shadow-lg">
+          <h3 class="text-xl font-semibold mb-4 text-blue-300">Удалённые видео</h3>
+          <div id="remoteVideos" class="space-y-4"></div>
+          <p id="noRemoteVideos" class="text-gray-400 italic">Нет активных соединений</p>
+        </div>
       </div>
 
-      <div class="mb-6">
-        <h3 class="text-lg font-semibold text-gray-700 mb-2">Remote Videos</h3>
-        <div id="remoteVideos" class="grid grid-cols-1 sm:grid-cols-2 gap-4"></div>
-      </div>
-
-      <div>
-        <h3 class="text-lg font-semibold text-gray-700 mb-2">Logs</h3>
-        <div id="logs" class="bg-white p-4 rounded-lg shadow h-40 overflow-y-auto text-sm text-gray-600"></div>
+      <div class="bg-gray-800 rounded-lg p-4 shadow-lg">
+        <div class="flex justify-between items-center mb-4">
+          <h3 class="text-xl font-semibold text-blue-300">Логи соединения</h3>
+          <button id="clearLogs" class="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm">Очистить</button>
+        </div>
+        <div id="logs" class="font-mono text-sm bg-gray-900 p-3 rounded-md h-64 overflow-y-auto"></div>
       </div>
     </div>
 
     <script>
-      const wsUrl = `wss://localhost:8080/websocket`;
+      // Глобальные переменные для управления соединением
       let pc = null;
-      let stream = null;
-      let isCameraOn = false;
-      const localVideo = document.getElementById('localVideo');
-      const remoteVideos = document.getElementById('remoteVideos');
-      const toggleCameraBtn = document.getElementById('toggleCamera');
-      const logs = document.getElementById('logs');
-      const localVideoPlaceholder = document.getElementById('localVideoPlaceholder');
+      let ws = null;
+      let localStream = null;
 
-      function logMessage(message) {
+      function addLog(message, type = 'info') {
+        const logsDiv = document.getElementById('logs');
+        const timestamp = new Date().toLocaleTimeString('ru-RU', { hour12: false });
+        const colors = {
+          info: 'text-gray-300',
+          error: 'text-red-400',
+          success: 'text-green-400',
+          warning: 'text-yellow-400',
+          important: 'text-blue-400',
+        };
         const logEntry = document.createElement('div');
-        logEntry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
-        logs.appendChild(logEntry);
-        logs.scrollTop = logs.scrollHeight;
+        logEntry.className = `mb-1 ${colors[type] || colors.info}`;
+        logEntry.innerHTML = `<span class="text-gray-500">[${timestamp}]</span> ${message}`;
+        logsDiv.appendChild(logEntry);
+        logsDiv.scrollTop = logsDiv.scrollHeight;
       }
 
-      function initializeWebRTC() {
-        pc = new RTCPeerConnection({
-          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-        });
-
-        pc.ontrack = function (event) {
-          if (event.track.kind === 'audio') return;
-          const el = document.createElement('video');
-          el.srcObject = event.streams[0];
-          el.autoplay = true;
-          el.controls = true;
-          el.className = 'w-full rounded-lg';
-          remoteVideos.appendChild(el);
-          logMessage(`Received remote ${event.track.kind} track`);
-          event.track.onmute = () => el.play();
-          event.streams[0].onremovetrack = ({ track }) => {
-            if (el.parentNode) {
-              el.parentNode.removeChild(el);
-              logMessage('Remote track removed');
-            }
-          };
-        };
-
-        const ws = new WebSocket(wsUrl);
-        ws.onopen = () => logMessage('WebSocket opened');
-        ws.onclose = () => {
-          logMessage('WebSocket closed');
-          alert('WebSocket connection closed');
-        };
-        ws.onerror = (evt) => logMessage('WebSocket error: ' + evt);
-
-        pc.onicecandidate = (e) => {
-          if (e.candidate) {
-            ws.send(JSON.stringify({ event: 'candidate', data: JSON.stringify(e.candidate) }));
-            logMessage('Sent ICE candidate');
-          }
-        };
-
-        ws.onmessage = async (evt) => {
-          let msg;
-          try {
-            msg = JSON.parse(evt.data);
-          } catch (e) {
-            logMessage('Failed to parse message: ' + e);
-            return;
-          }
-          if (!msg) {
-            logMessage('Empty message received');
-            return;
-          }
-          switch (msg.event) {
-            case 'offer':
-              let offer;
-              try {
-                offer = JSON.parse(msg.data);
-              } catch (e) {
-                logMessage('Failed to parse offer: ' + e);
-                return;
-              }
-              if (!offer) {
-                logMessage('Empty offer received');
-                return;
-              }
-              await pc.setRemoteDescription(offer);
-              const answer = await pc.createAnswer();
-              await pc.setLocalDescription(answer);
-              ws.send(JSON.stringify({ event: 'answer', data: JSON.stringify(answer) }));
-              logMessage('Sent answer');
-              break;
-            case 'candidate':
-              let candidate;
-              try {
-                candidate = JSON.parse(msg.data);
-              } catch (e) {
-                logMessage('Failed to parse candidate: ' + e);
-                return;
-              }
-              if (!candidate) {
-                logMessage('Empty candidate received');
-                return;
-              }
-              await pc.addIceCandidate(candidate);
-              logMessage('Added ICE candidate');
-              break;
-            default:
-              logMessage('Unknown event: ' + msg.event);
-          }
-        };
-      }
-
-      toggleCameraBtn.addEventListener('click', async () => {
-        if (isCameraOn) {
-          if (stream) {
-            stream.getTracks().forEach((track) => {
-              track.stop();
-              const sender = pc.getSenders().find((s) => s.track === track);
-              if (sender) pc.removeTrack(sender);
-            });
-            stream = null;
-            localVideo.srcObject = null;
-            logMessage('Camera stopped');
-          }
-          localVideo.classList.add('hidden');
-          localVideoPlaceholder.classList.remove('hidden');
-          toggleCameraBtn.textContent = 'Enable Camera';
-          toggleCameraBtn.classList.remove('bg-red-500', 'hover:bg-red-600');
-          toggleCameraBtn.classList.add('bg-blue-500', 'hover:bg-blue-600');
-          isCameraOn = false;
-        } else {
-          try {
-            stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-            localVideo.srcObject = stream;
-            localVideo.classList.remove('hidden');
-            localVideoPlaceholder.classList.add('hidden');
-            stream.getTracks().forEach((track) => {
-              pc.addTrack(track, stream);
-              logMessage(`Added ${track.kind} track`);
-            });
-            toggleCameraBtn.textContent = 'Disable Camera';
-            toggleCameraBtn.classList.remove('bg-blue-500', 'hover:bg-blue-600');
-            toggleCameraBtn.classList.add('bg-red-500', 'hover:bg-red-600');
-            isCameraOn = true;
-            logMessage('Camera started');
-          } catch (e) {
-            logMessage('Failed to get media devices: ' + e);
-            alert('Failed to access camera: ' + e.message);
-          }
+      function cleanup() {
+        if (pc) {
+          pc.close();
+          pc = null;
         }
+        if (ws) {
+          ws.close();
+          ws = null;
+        }
+        if (localStream) {
+          localStream.getTracks().forEach((track) => track.stop());
+          localStream = null;
+        }
+        document.getElementById('remoteVideos').innerHTML = '';
+        document.getElementById('noRemoteVideos').style.display = 'block';
+      }
+
+      document.getElementById('clearLogs').addEventListener('click', () => {
+        document.getElementById('logs').innerHTML = '';
+        addLog('Логи очищены', 'important');
       });
 
-      initializeWebRTC();
+      async function start() {
+        // Очистка предыдущего соединения
+        cleanup();
+
+        addLog('Запуск приложения', 'important');
+
+        try {
+          // Инициализация PeerConnection с STUN серверами
+          pc = new RTCPeerConnection({
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+          });
+          addLog('Создано соединение RTCPeerConnection', 'success');
+
+          // Инициализация WebSocket
+          ws = new WebSocket('ws://localhost:8080/websocket');
+          addLog('Подключение WebSocket к ws://localhost:8080/websocket', 'info');
+
+          const remoteVideosContainer = document.getElementById('remoteVideos');
+          const noRemoteVideosMsg = document.getElementById('noRemoteVideos');
+
+          function updateRemoteVideosUI() {
+            noRemoteVideosMsg.style.display = remoteVideosContainer.children.length ? 'none' : 'block';
+          }
+
+          // Обработчик получения треков
+          pc.ontrack = ({ track, streams }) => {
+            if (track.kind === 'audio') {
+              addLog(`Получен аудиотрек (ID: ${track.id})`, 'info');
+              return;
+            }
+
+            addLog(`Получен видеотрек (ID: ${track.id})`, 'success');
+
+            // Удаляем старый элемент, если он существует
+            const existingVideo = remoteVideosContainer.querySelector(`[data-track-id="${track.id}"]`);
+            if (existingVideo) {
+              existingVideo.remove();
+            }
+
+            // Создаем новый видеоэлемент с отдельным MediaStream
+            const video = document.createElement('video');
+            video.className = 'w-full h-auto rounded-md bg-gray-700';
+            video.dataset.trackId = track.id;
+            video.autoplay = true;
+            video.controls = true;
+
+            // Создаем новый MediaStream для каждого трека
+            const stream = new MediaStream([track]);
+            video.srcObject = stream;
+
+            remoteVideosContainer.appendChild(video);
+            updateRemoteVideosUI();
+
+            // Обработчики событий трека
+            track.onmute = () => {
+              addLog(`Видеотрек заглушён (ID: ${track.id})`, 'warning');
+              video.remove();
+              updateRemoteVideosUI();
+            };
+
+            track.onunmute = () => {
+              addLog(`Видеотрек восстановлен (ID: ${track.id})`, 'success');
+              if (!remoteVideosContainer.querySelector(`[data-track-id="${track.id}"]`)) {
+                video.srcObject = new MediaStream([track]);
+                remoteVideosContainer.appendChild(video);
+                updateRemoteVideosUI();
+              }
+            };
+
+            track.onended = () => {
+              addLog(`Видеотрек завершён (ID: ${track.id})`, 'warning');
+              video.remove();
+              updateRemoteVideosUI();
+            };
+          };
+
+          // Обработчики ICE кандидатов
+          pc.onicecandidate = ({ candidate }) => {
+            if (candidate && ws.readyState === WebSocket.OPEN) {
+              addLog('Отправлен ICE-кандидат', 'info');
+              ws.send(
+                JSON.stringify({
+                  event: 'candidate',
+                  data: JSON.stringify(candidate.toJSON()),
+                }),
+              );
+            } else if (!candidate) {
+              addLog('Сбор ICE-кандидатов завершён', 'success');
+            }
+          };
+
+          pc.oniceconnectionstatechange = () => {
+            const state = pc.iceConnectionState;
+            addLog(`Состояние ICE: ${state}`, 'important');
+
+            if (state === 'disconnected' || state === 'failed') {
+              document.getElementById('remoteVideos').innerHTML = '';
+              updateRemoteVideosUI();
+            }
+          };
+
+          pc.onsignalingstatechange = () => {
+            addLog(`Состояние сигнализации: ${pc.signalingState}`, 'important');
+          };
+
+          // Обработчики WebSocket
+          ws.onopen = () => {
+            addLog('WebSocket соединение установлено', 'success');
+          };
+
+          ws.onclose = () => {
+            addLog('WebSocket соединение закрыто', 'error');
+            cleanup();
+          };
+
+          ws.onerror = (error) => {
+            addLog(`Ошибка WebSocket: ${error}`, 'error');
+          };
+
+          ws.onmessage = async ({ data }) => {
+            try {
+              const msg = JSON.parse(data);
+              if (!msg) {
+                addLog('Получено пустое сообщение WebSocket', 'warning');
+                return;
+              }
+
+              switch (msg.event) {
+                case 'offer':
+                  addLog('Получен Offer', 'important');
+                  try {
+                    const offer = JSON.parse(msg.data);
+                    if (!offer) {
+                      addLog('Offer пустой', 'error');
+                      return;
+                    }
+
+                    await pc.setRemoteDescription(new RTCSessionDescription(offer));
+                    addLog('Remote Description установлен', 'success');
+
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    addLog('Local Description установлен', 'success');
+
+                    if (ws.readyState === WebSocket.OPEN) {
+                      ws.send(
+                        JSON.stringify({
+                          event: 'answer',
+                          data: JSON.stringify(answer),
+                        }),
+                      );
+                      addLog('Ответ отправлен', 'important');
+                    }
+                  } catch (err) {
+                    addLog(`Ошибка обработки offer: ${err.message}`, 'error');
+                  }
+                  break;
+
+                case 'candidate':
+                  addLog('Получен ICE-кандидат', 'info');
+                  try {
+                    const candidate = JSON.parse(msg.data);
+                    if (candidate) {
+                      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                      addLog('ICE-кандидат добавлен', 'success');
+                    } else {
+                      addLog('ICE-кандидат пустой', 'warning');
+                    }
+                  } catch (err) {
+                    addLog(`Ошибка добавления ICE-кандидата: ${err.message}`, 'error');
+                  }
+                  break;
+              }
+            } catch (err) {
+              addLog(`Ошибка обработки сообщения: ${err.message}`, 'error');
+            }
+          };
+
+          // Получение медиапотока
+          try {
+            addLog('Попытка получить доступ к камере и микрофону', 'info');
+            localStream = await navigator.mediaDevices
+              .getUserMedia({
+                video: true,
+                audio: true,
+              })
+              .catch(() => {
+                addLog('Камера и микрофон не подключены, подключаемся как зритель', 'warning');
+                return null;
+              });
+
+            if (localStream) {
+              addLog('Доступ к медиа получен', 'success');
+              document.getElementById('localVideo').srcObject = localStream;
+
+              // Добавляем треки в соединение
+              localStream.getTracks().forEach((track) => {
+                pc.addTrack(track, localStream);
+                addLog(`Добавлен ${track.kind} трек (ID: ${track.id})`, 'success');
+              });
+            } else {
+              addLog('Подключение без локальных медиа', 'info');
+            }
+          } catch (err) {
+            addLog(`Ошибка доступа к медиа: ${err.message}`, 'error');
+          }
+        } catch (err) {
+          addLog(`Ошибка инициализации: ${err.message}`, 'error');
+          cleanup();
+        }
+      }
+
+      // Запуск приложения
+      start();
+
+      // Обработчик перезагрузки страницы
+      window.addEventListener('beforeunload', () => {
+        cleanup();
+      });
     </script>
   </body>
 </html>
