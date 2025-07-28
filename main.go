@@ -20,7 +20,7 @@ var (
 	addr          = flag.String("addr", ":8080", "http service address")
 	indexTemplate = &template.Template{}
 	listLock      sync.RWMutex
-	connections   []connection
+	connections   []*connection
 	trackLocals   map[string]*webrtc.TrackLocalStaticRTP
 )
 
@@ -30,9 +30,10 @@ type websocketMessage struct {
 }
 
 type connection struct {
-	pc   *webrtc.PeerConnection
-	kws  *socketio.Websocket
-	lock sync.Mutex
+	pc     *webrtc.PeerConnection
+	kws    *socketio.Websocket
+	lock   sync.Mutex
+	tracks map[string]*webrtc.TrackLocalStaticRTP
 }
 
 func writeJSON(kws *socketio.Websocket, lock *sync.Mutex, v interface{}) error {
@@ -74,14 +75,23 @@ func main() {
 		defer listLock.Unlock()
 		for i, conn := range connections {
 			if conn.kws.GetUUID() == ep.Kws.GetUUID() {
-				connections = append(connections[:i], connections[i+1:]...)
+				// Remove all tracks associated with this connection
+				for trackID := range conn.tracks {
+					if _, ok := trackLocals[trackID]; ok {
+						delete(trackLocals, trackID)
+					}
+				}
+				// Close and remove connection
 				if err := conn.pc.Close(); err != nil {
 					log.Errorf("Failed to close PeerConnection: %v", err)
 				}
-				signalPeerConnections()
+				connections = append(connections[:i], connections[i+1:]...)
 				break
 			}
 		}
+		listLock.Unlock() // Unlock before signaling
+		signalPeerConnections()
+		listLock.Lock() // Re-lock for defer
 		log.Infof("Disconnected: %s", ep.Kws.GetUUID())
 	})
 
@@ -116,11 +126,17 @@ func main() {
 			}
 		}
 
+		conn := &connection{
+			pc:     pc,
+			kws:    kws,
+			tracks: make(map[string]*webrtc.TrackLocalStaticRTP),
+		}
+
 		listLock.Lock()
-		connections = append(connections, connection{pc: pc, kws: kws})
+		connections = append(connections, conn)
 		listLock.Unlock()
 
-		setupWebRTCHandlers(pc, kws)
+		setupWebRTCHandlers(conn)
 
 		signalPeerConnections()
 	}))
@@ -136,7 +152,10 @@ func main() {
 	}
 }
 
-func setupWebRTCHandlers(pc *webrtc.PeerConnection, kws *socketio.Websocket) {
+func setupWebRTCHandlers(conn *connection) {
+	pc := conn.pc
+	kws := conn.kws
+
 	pc.OnICECandidate(func(i *webrtc.ICECandidate) {
 		if i == nil {
 			return
@@ -146,7 +165,7 @@ func setupWebRTCHandlers(pc *webrtc.PeerConnection, kws *socketio.Websocket) {
 			log.Errorf("Failed to marshal candidate: %v", err)
 			return
 		}
-		if err := writeJSON(kws, &sync.Mutex{}, &websocketMessage{
+		if err := writeJSON(kws, &conn.lock, &websocketMessage{
 			Event: "candidate",
 			Data:  string(candidateString),
 		}); err != nil {
@@ -166,7 +185,11 @@ func setupWebRTCHandlers(pc *webrtc.PeerConnection, kws *socketio.Websocket) {
 	})
 
 	pc.OnTrack(func(t *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		trackLocal := addTrack(t)
+		trackLocal := addTrack(conn, t)
+		if trackLocal == nil {
+			return
+		}
+
 		go func() {
 			defer removeTrack(trackLocal)
 			buf := make([]byte, 1500)
@@ -202,7 +225,7 @@ func websocketHandler(ep *socketio.EventPayload) {
 	}
 
 	listLock.RLock()
-	var conn connection
+	var conn *connection
 	for _, c := range connections {
 		if c.kws.GetUUID() == ep.Kws.GetUUID() {
 			conn = c
@@ -211,7 +234,7 @@ func websocketHandler(ep *socketio.EventPayload) {
 	}
 	listLock.RUnlock()
 
-	if conn.pc == nil {
+	if conn == nil || conn.pc == nil {
 		log.Errorf("No PeerConnection found for UUID: %s", ep.Kws.GetUUID())
 		return
 	}
@@ -244,7 +267,7 @@ func websocketHandler(ep *socketio.EventPayload) {
 	}
 }
 
-func addTrack(t *webrtc.TrackRemote) *webrtc.TrackLocalStaticRTP {
+func addTrack(conn *connection, t *webrtc.TrackRemote) *webrtc.TrackLocalStaticRTP {
 	listLock.Lock()
 	defer func() {
 		listLock.Unlock()
@@ -257,12 +280,13 @@ func addTrack(t *webrtc.TrackRemote) *webrtc.TrackLocalStaticRTP {
 		return nil
 	}
 
-	// Удаляем старый трек, если есть
+	// Remove old track if exists
 	if oldTrack, exists := trackLocals[t.ID()]; exists {
 		removeTrack(oldTrack)
 	}
 
 	trackLocals[t.ID()] = trackLocal
+	conn.tracks[t.ID()] = trackLocal
 	return trackLocal
 }
 

@@ -1,300 +1,150 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html>
   <head>
     <meta charset="utf-8" />
-    <title>WebRTC Video Chat</title>
-    <script src="https://cdn.tailwindcss.com"></script>
   </head>
-  <body class="bg-gray-900 text-gray-200 min-h-screen p-6">
-    <div class="max-w-6xl mx-auto">
-      <h1 class="text-3xl font-bold mb-8 text-center text-blue-400">WebRTC Video Chat</h1>
+  <body>
+    <h3>Local Video</h3>
+    <video id="localVideo" width="160" height="120" autoplay muted></video> <br />
 
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
-        <div class="bg-gray-800 rounded-lg p-4 shadow-lg">
-          <h3 class="text-xl font-semibold mb-4 text-blue-300">Ваше видео</h3>
-          <video id="localVideo" class="w-full h-auto rounded-md bg-gray-700" width="160" height="120" autoplay muted></video>
-        </div>
+    <h3>Remote Video</h3>
+    <div id="remoteVideos"></div>
+    <br />
 
-        <div class="bg-gray-800 rounded-lg p-4 shadow-lg">
-          <h3 class="text-xl font-semibold mb-4 text-blue-300">Удалённые видео</h3>
-          <div id="remoteVideos" class="space-y-4"></div>
-          <p id="noRemoteVideos" class="text-gray-400 italic">Нет активных соединений</p>
-        </div>
-      </div>
+    <h3>Logs</h3>
+    <div id="logs"></div>
+  </body>
 
-      <div class="bg-gray-800 rounded-lg p-4 shadow-lg">
-        <div class="flex justify-between items-center mb-4">
-          <h3 class="text-xl font-semibold text-blue-300">Логи соединения</h3>
-          <button id="clearLogs" class="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-sm">Очистить</button>
-        </div>
-        <div id="logs" class="font-mono text-sm bg-gray-900 p-3 rounded-md h-64 overflow-y-auto"></div>
-      </div>
-    </div>
-
-    <script>
-      // Глобальные переменные для управления соединением
-      let pc = null;
-      let ws = null;
-      let localStream = null;
-
-      function addLog(message, type = 'info') {
-        const logsDiv = document.getElementById('logs');
-        const timestamp = new Date().toLocaleTimeString('ru-RU', { hour12: false });
-        const colors = {
-          info: 'text-gray-300',
-          error: 'text-red-400',
-          success: 'text-green-400',
-          warning: 'text-yellow-400',
-          important: 'text-blue-400',
-        };
-        const logEntry = document.createElement('div');
-        logEntry.className = `mb-1 ${colors[type] || colors.info}`;
-        logEntry.innerHTML = `<span class="text-gray-500">[${timestamp}]</span> ${message}`;
-        logsDiv.appendChild(logEntry);
-        logsDiv.scrollTop = logsDiv.scrollHeight;
-      }
-
-      function cleanup() {
-        if (pc) {
-          pc.close();
-          pc = null;
-        }
-        if (ws) {
-          ws.close();
-          ws = null;
-        }
-        if (localStream) {
-          localStream.getTracks().forEach((track) => track.stop());
-          localStream = null;
-        }
-        document.getElementById('remoteVideos').innerHTML = '';
-        document.getElementById('noRemoteVideos').style.display = 'block';
-      }
-
-      document.getElementById('clearLogs').addEventListener('click', () => {
-        document.getElementById('logs').innerHTML = '';
-        addLog('Логи очищены', 'important');
+  <script>
+    // Функция для инициализации WebRTC-соединения
+    function initPeerConnection() {
+      let pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
       });
 
-      async function start() {
-        // Очистка предыдущего соединения
-        cleanup();
+      pc.ontrack = function (event) {
+        if (event.track.kind === 'audio') {
+          return;
+        }
 
-        addLog('Запуск приложения', 'important');
+        let el = document.createElement(event.track.kind);
+        el.srcObject = event.streams[0];
+        el.autoplay = true;
+        el.controls = true;
+        document.getElementById('remoteVideos').appendChild(el);
 
-        try {
-          // Инициализация PeerConnection с STUN серверами
-          pc = new RTCPeerConnection({
-            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-          });
-          addLog('Создано соединение RTCPeerConnection', 'success');
+        event.track.onmute = function () {
+          el.play();
+        };
 
-          // Инициализация WebSocket
-          ws = new WebSocket('ws://localhost:8080/websocket');
-          addLog('Подключение WebSocket к ws://localhost:8080/websocket', 'info');
-
-          const remoteVideosContainer = document.getElementById('remoteVideos');
-          const noRemoteVideosMsg = document.getElementById('noRemoteVideos');
-
-          function updateRemoteVideosUI() {
-            noRemoteVideosMsg.style.display = remoteVideosContainer.children.length ? 'none' : 'block';
+        event.streams[0].onremovetrack = ({ track }) => {
+          if (el.parentNode) {
+            el.parentNode.removeChild(el);
           }
+        };
+      };
 
-          // Обработчик получения треков
-          pc.ontrack = ({ track, streams }) => {
-            if (track.kind === 'audio') {
-              addLog(`Получен аудиотрек (ID: ${track.id})`, 'info');
+      pc.oniceconnectionstatechange = function () {
+        console.log('ICE connection state:', pc.iceConnectionState);
+        if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+          console.log('ICE connection failed or disconnected, attempting to reconnect');
+          reconnect();
+        }
+      };
+
+      return pc;
+    }
+
+    // Функция для настройки WebSocket
+    function setupWebSocket(pc) {
+      let ws = new WebSocket('ws://localhost:8080/websocket');
+
+      pc.onicecandidate = (e) => {
+        if (!e.candidate) {
+          return;
+        }
+        ws.send(JSON.stringify({ event: 'candidate', data: JSON.stringify(e.candidate) }));
+      };
+
+      ws.onclose = function () {
+        console.log('WebSocket closed, attempting to reconnect');
+        reconnect();
+      };
+
+      ws.onmessage = function (evt) {
+        let msg;
+        try {
+          msg = JSON.parse(evt.data);
+        } catch (e) {
+          console.log('Failed to parse msg:', e);
+          return;
+        }
+
+        switch (msg.event) {
+          case 'offer':
+            let offer;
+            try {
+              offer = JSON.parse(msg.data);
+            } catch (e) {
+              console.log('Failed to parse offer:', e);
               return;
             }
-
-            addLog(`Получен видеотрек (ID: ${track.id})`, 'success');
-
-            // Удаляем старый элемент, если он существует
-            const existingVideo = remoteVideosContainer.querySelector(`[data-track-id="${track.id}"]`);
-            if (existingVideo) {
-              existingVideo.remove();
-            }
-
-            // Создаем новый видеоэлемент с отдельным MediaStream
-            const video = document.createElement('video');
-            video.className = 'w-full h-auto rounded-md bg-gray-700';
-            video.dataset.trackId = track.id;
-            video.autoplay = true;
-            video.controls = true;
-
-            // Создаем новый MediaStream для каждого трека
-            const stream = new MediaStream([track]);
-            video.srcObject = stream;
-
-            remoteVideosContainer.appendChild(video);
-            updateRemoteVideosUI();
-
-            // Обработчики событий трека
-            track.onmute = () => {
-              addLog(`Видеотрек заглушён (ID: ${track.id})`, 'warning');
-              video.remove();
-              updateRemoteVideosUI();
-            };
-
-            track.onunmute = () => {
-              addLog(`Видеотрек восстановлен (ID: ${track.id})`, 'success');
-              if (!remoteVideosContainer.querySelector(`[data-track-id="${track.id}"]`)) {
-                video.srcObject = new MediaStream([track]);
-                remoteVideosContainer.appendChild(video);
-                updateRemoteVideosUI();
-              }
-            };
-
-            track.onended = () => {
-              addLog(`Видеотрек завершён (ID: ${track.id})`, 'warning');
-              video.remove();
-              updateRemoteVideosUI();
-            };
-          };
-
-          // Обработчики ICE кандидатов
-          pc.onicecandidate = ({ candidate }) => {
-            if (candidate && ws.readyState === WebSocket.OPEN) {
-              addLog('Отправлен ICE-кандидат', 'info');
-              ws.send(
-                JSON.stringify({
-                  event: 'candidate',
-                  data: JSON.stringify(candidate.toJSON()),
-                }),
-              );
-            } else if (!candidate) {
-              addLog('Сбор ICE-кандидатов завершён', 'success');
-            }
-          };
-
-          pc.oniceconnectionstatechange = () => {
-            const state = pc.iceConnectionState;
-            addLog(`Состояние ICE: ${state}`, 'important');
-
-            if (state === 'disconnected' || state === 'failed') {
-              document.getElementById('remoteVideos').innerHTML = '';
-              updateRemoteVideosUI();
-            }
-          };
-
-          pc.onsignalingstatechange = () => {
-            addLog(`Состояние сигнализации: ${pc.signalingState}`, 'important');
-          };
-
-          // Обработчики WebSocket
-          ws.onopen = () => {
-            addLog('WebSocket соединение установлено', 'success');
-          };
-
-          ws.onclose = () => {
-            addLog('WebSocket соединение закрыто', 'error');
-            cleanup();
-          };
-
-          ws.onerror = (error) => {
-            addLog(`Ошибка WebSocket: ${error}`, 'error');
-          };
-
-          ws.onmessage = async ({ data }) => {
-            try {
-              const msg = JSON.parse(data);
-              if (!msg) {
-                addLog('Получено пустое сообщение WebSocket', 'warning');
-                return;
-              }
-
-              switch (msg.event) {
-                case 'offer':
-                  addLog('Получен Offer', 'important');
-                  try {
-                    const offer = JSON.parse(msg.data);
-                    if (!offer) {
-                      addLog('Offer пустой', 'error');
-                      return;
-                    }
-
-                    await pc.setRemoteDescription(new RTCSessionDescription(offer));
-                    addLog('Remote Description установлен', 'success');
-
-                    const answer = await pc.createAnswer();
-                    await pc.setLocalDescription(answer);
-                    addLog('Local Description установлен', 'success');
-
-                    if (ws.readyState === WebSocket.OPEN) {
-                      ws.send(
-                        JSON.stringify({
-                          event: 'answer',
-                          data: JSON.stringify(answer),
-                        }),
-                      );
-                      addLog('Ответ отправлен', 'important');
-                    }
-                  } catch (err) {
-                    addLog(`Ошибка обработки offer: ${err.message}`, 'error');
-                  }
-                  break;
-
-                case 'candidate':
-                  addLog('Получен ICE-кандидат', 'info');
-                  try {
-                    const candidate = JSON.parse(msg.data);
-                    if (candidate) {
-                      await pc.addIceCandidate(new RTCIceCandidate(candidate));
-                      addLog('ICE-кандидат добавлен', 'success');
-                    } else {
-                      addLog('ICE-кандидат пустой', 'warning');
-                    }
-                  } catch (err) {
-                    addLog(`Ошибка добавления ICE-кандидата: ${err.message}`, 'error');
-                  }
-                  break;
-              }
-            } catch (err) {
-              addLog(`Ошибка обработки сообщения: ${err.message}`, 'error');
-            }
-          };
-
-          // Получение медиапотока
-          try {
-            addLog('Попытка получить доступ к камере и микрофону', 'info');
-            localStream = await navigator.mediaDevices
-              .getUserMedia({
-                video: true,
-                audio: true,
+            pc.setRemoteDescription(offer)
+              .then(() => pc.createAnswer())
+              .then((answer) => pc.setLocalDescription(answer))
+              .then(() => {
+                ws.send(JSON.stringify({ event: 'answer', data: JSON.stringify(pc.localDescription) }));
               })
-              .catch(() => {
-                addLog('Камера и микрофон не подключены, подключаемся как зритель', 'warning');
-                return null;
-              });
+              .catch((e) => console.log('Error handling offer:', e));
+            break;
 
-            if (localStream) {
-              addLog('Доступ к медиа получен', 'success');
-              document.getElementById('localVideo').srcObject = localStream;
-
-              // Добавляем треки в соединение
-              localStream.getTracks().forEach((track) => {
-                pc.addTrack(track, localStream);
-                addLog(`Добавлен ${track.kind} трек (ID: ${track.id})`, 'success');
-              });
-            } else {
-              addLog('Подключение без локальных медиа', 'info');
+          case 'candidate':
+            let candidate;
+            try {
+              candidate = JSON.parse(msg.data);
+            } catch (e) {
+              console.log('Failed to parse candidate:', e);
+              return;
             }
-          } catch (err) {
-            addLog(`Ошибка доступа к медиа: ${err.message}`, 'error');
-          }
-        } catch (err) {
-          addLog(`Ошибка инициализации: ${err.message}`, 'error');
-          cleanup();
+            pc.addIceCandidate(candidate).catch((e) => console.log('Error adding ICE candidate:', e));
+            break;
         }
-      }
+      };
 
-      // Запуск приложения
-      start();
+      ws.onerror = function (evt) {
+        console.log('WebSocket error:', evt);
+      };
 
-      // Обработчик перезагрузки страницы
-      window.addEventListener('beforeunload', () => {
-        cleanup();
-      });
-    </script>
-  </body>
+      return ws;
+    }
+
+    // Функция для повторного подключения
+    function reconnect() {
+      setTimeout(() => {
+        console.log('Attempting to reconnect...');
+        initConnection();
+      }, 1000);
+    }
+
+    // Основная функция для инициализации соединения
+    function initConnection() {
+      let pc = initPeerConnection();
+      let ws = setupWebSocket(pc);
+
+      // Запрашиваем доступ к камере/микрофону, но делаем это опциональным
+      navigator.mediaDevices
+        .getUserMedia({ video: true, audio: true })
+        .then((stream) => {
+          document.getElementById('localVideo').srcObject = stream;
+          stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+          console.log('Local stream added');
+        })
+        .catch((e) => {
+          console.log('No local stream available (camera/microphone disabled):', e);
+        });
+    }
+
+    // Запускаем соединение
+    initConnection();
+  </script>
 </html>
