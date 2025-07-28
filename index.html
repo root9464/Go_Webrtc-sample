@@ -2,149 +2,225 @@
 <html>
   <head>
     <meta charset="utf-8" />
+    <script src="https://cdn.tailwindcss.com"></script>
   </head>
-  <body>
-    <h3>Local Video</h3>
-    <video id="localVideo" width="160" height="120" autoplay muted></video> <br />
+  <body class="bg-neutral-950 text-gray-300 font-mono text-sm min-h-screen flex flex-col items-center p-4">
+    <h1 class="text-lg text-gray-400 mb-4">WebRTC Video</h1>
 
-    <h3>Remote Video</h3>
-    <div id="remoteVideos"></div>
-    <br />
+    <div class="w-full max-w-md bg-neutral-900 p-3 rounded mb-4">
+      <input
+        type="text"
+        id="roomId"
+        placeholder="Room ID"
+        class="w-full p-2 bg-neutral-800 text-gray-300 border border-neutral-700 rounded focus:outline-none focus:border-gray-500" />
+      <button id="joinRoom" class="mt-2 w-full p-2 bg-neutral-700 text-gray-200 rounded hover:bg-neutral-600 transition">Join</button>
+    </div>
 
-    <h3>Logs</h3>
-    <div id="logs"></div>
-  </body>
+    <div class="w-full max-w-md flex flex-col gap-4">
+      <div>
+        <h3 class="text-sm text-gray-400">Local</h3>
+        <video id="localVideo" width="320" height="240" autoplay muted class="bg-black rounded"></video>
+      </div>
+      <div>
+        <h3 class="text-sm text-gray-400">Remote</h3>
+        <div id="remoteVideos"></div>
+      </div>
+    </div>
 
-  <script>
-    // Функция для инициализации WebRTC-соединения
-    function initPeerConnection() {
-      let pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    <div class="w-full max-w-md mt-4">
+      <h3 class="text-sm text-gray-400">Logs</h3>
+      <div id="logs" class="p-2 bg-neutral-900 rounded max-h-40 overflow-y-auto"></div>
+    </div>
+
+    <script>
+      let pc = null;
+      let ws = null;
+      let roomId = '';
+      let localStream = null;
+      const logElement = document.getElementById('logs');
+
+      function log(message, type = 'info') {
+        console.log(message);
+        const logEntry = document.createElement('div');
+        const timestamp = new Date().toLocaleTimeString();
+        const colorClass = type === 'error' ? 'text-red-400' : type === 'success' ? 'text-green-400' : 'text-gray-400';
+        logEntry.className = colorClass;
+        logEntry.textContent = `[${timestamp}] ${message}`;
+        logElement.prepend(logEntry);
+      }
+
+      document.getElementById('joinRoom').addEventListener('click', () => {
+        const inputRoomId = document.getElementById('roomId').value.trim();
+        if (inputRoomId) {
+          roomId = inputRoomId;
+          log(`Joining room: ${roomId}`, 'success');
+          initConnection();
+        } else {
+          log('Enter a room ID', 'error');
+        }
       });
 
-      pc.ontrack = function (event) {
-        if (event.track.kind === 'audio') {
-          return;
+      function initPeerConnection() {
+        if (pc) {
+          pc.close();
         }
 
-        let el = document.createElement(event.track.kind);
-        el.srcObject = event.streams[0];
-        el.autoplay = true;
-        el.controls = true;
-        document.getElementById('remoteVideos').appendChild(el);
+        pc = new RTCPeerConnection({
+          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+        });
 
-        event.track.onmute = function () {
-          el.play();
+        pc.ontrack = function (event) {
+          if (event.track.kind === 'audio') return;
+
+          log(`Received ${event.track.kind} track`, 'success');
+
+          const stream = event.streams[0];
+          const container = document.createElement('div');
+          container.className = 'remote-video-container';
+
+          const video = document.createElement('video');
+          video.srcObject = stream;
+          video.autoplay = true;
+          video.controls = true;
+          video.width = 320;
+          video.height = 240;
+          video.className = 'bg-black rounded';
+
+          const label = document.createElement('div');
+          label.className = 'text-gray-400 text-sm';
+          label.textContent = `Participant ${document.getElementById('remoteVideos').childElementCount + 1}`;
+
+          container.appendChild(label);
+          container.appendChild(video);
+          document.getElementById('remoteVideos').appendChild(container);
+
+          event.track.onmute = () => video.play();
+
+          stream.onremovetrack = () => {
+            if (container.parentNode) {
+              container.parentNode.removeChild(container);
+            }
+          };
         };
 
-        event.streams[0].onremovetrack = ({ track }) => {
-          if (el.parentNode) {
-            el.parentNode.removeChild(el);
+        pc.oniceconnectionstatechange = () => {
+          log(`ICE state: ${pc.iceConnectionState}`);
+          if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+            log('Connection lost, reconnecting...', 'error');
+            setTimeout(initConnection, 2000);
           }
         };
-      };
 
-      pc.oniceconnectionstatechange = function () {
-        console.log('ICE connection state:', pc.iceConnectionState);
-        if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
-          console.log('ICE connection failed or disconnected, attempting to reconnect');
-          reconnect();
-        }
-      };
+        pc.onnegotiationneeded = () => {
+          log('Creating offer...');
+          pc.createOffer()
+            .then((offer) => pc.setLocalDescription(offer))
+            .then(() => {
+              if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(
+                  JSON.stringify({
+                    event: 'offer',
+                    data: JSON.stringify(pc.localDescription),
+                  }),
+                );
+              }
+            })
+            .catch((error) => log(`Offer error: ${error}`, 'error'));
+        };
 
-      return pc;
-    }
+        return pc;
+      }
 
-    // Функция для настройки WebSocket
-    function setupWebSocket(pc) {
-      let ws = new WebSocket('ws://localhost:8080/websocket');
-
-      pc.onicecandidate = (e) => {
-        if (!e.candidate) {
-          return;
-        }
-        ws.send(JSON.stringify({ event: 'candidate', data: JSON.stringify(e.candidate) }));
-      };
-
-      ws.onclose = function () {
-        console.log('WebSocket closed, attempting to reconnect');
-        reconnect();
-      };
-
-      ws.onmessage = function (evt) {
-        let msg;
-        try {
-          msg = JSON.parse(evt.data);
-        } catch (e) {
-          console.log('Failed to parse msg:', e);
-          return;
+      function setupWebSocket() {
+        if (ws) {
+          ws.close();
         }
 
-        switch (msg.event) {
-          case 'offer':
-            let offer;
-            try {
-              offer = JSON.parse(msg.data);
-            } catch (e) {
-              console.log('Failed to parse offer:', e);
-              return;
-            }
-            pc.setRemoteDescription(offer)
-              .then(() => pc.createAnswer())
-              .then((answer) => pc.setLocalDescription(answer))
-              .then(() => {
-                ws.send(JSON.stringify({ event: 'answer', data: JSON.stringify(pc.localDescription) }));
-              })
-              .catch((e) => console.log('Error handling offer:', e));
-            break;
+        ws = new WebSocket(`ws://localhost:8080/websocket?room_id=${encodeURIComponent(roomId)}`);
 
-          case 'candidate':
-            let candidate;
-            try {
-              candidate = JSON.parse(msg.data);
-            } catch (e) {
-              console.log('Failed to parse candidate:', e);
-              return;
-            }
-            pc.addIceCandidate(candidate).catch((e) => console.log('Error adding ICE candidate:', e));
-            break;
+        ws.onopen = () => {
+          log(`WebSocket connected: ${roomId}`, 'success');
+        };
+
+        ws.onclose = () => {
+          log('WebSocket closed, reconnecting...', 'error');
+          setTimeout(initConnection, 2000);
+        };
+
+        ws.onerror = (event) => {
+          log(`WebSocket error: ${event}`, 'error');
+        };
+
+        ws.onmessage = (event) => {
+          let msg;
+          try {
+            msg = JSON.parse(event.data);
+          } catch (e) {
+            log(`Parse error: ${e}`, 'error');
+            return;
+          }
+
+          switch (msg.event) {
+            case 'offer':
+              try {
+                const offer = JSON.parse(msg.data);
+                pc.setRemoteDescription(offer)
+                  .then(() => pc.createAnswer())
+                  .then((answer) => pc.setLocalDescription(answer))
+                  .then(() => {
+                    ws.send(
+                      JSON.stringify({
+                        event: 'answer',
+                        data: JSON.stringify(pc.localDescription),
+                      }),
+                    );
+                  })
+                  .catch((error) => log(`Offer error: ${error}`, 'error'));
+              } catch (e) {
+                log(`Parse offer error: ${e}`, 'error');
+              }
+              break;
+
+            case 'candidate':
+              try {
+                const candidate = JSON.parse(msg.data);
+                pc.addIceCandidate(candidate).catch((error) => log(`ICE candidate error: ${error}`, 'error'));
+              } catch (e) {
+                log(`Parse candidate error: ${e}`, 'error');
+              }
+              break;
+          }
+        };
+
+        return ws;
+      }
+
+      function initConnection() {
+        document.getElementById('remoteVideos').innerHTML = '';
+        log(`Connecting to room: ${roomId}`);
+
+        initPeerConnection();
+
+        setupWebSocket();
+
+        if (!localStream) {
+          navigator.mediaDevices
+            .getUserMedia({ video: true, audio: true })
+            .then((stream) => {
+              localStream = stream;
+              document.getElementById('localVideo').srcObject = stream;
+              stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+              log('Local stream added', 'success');
+            })
+            .catch((error) => {
+              log(`Media error: ${error}`, 'error');
+              log('Camera/mic unavailable', 'error');
+            });
+        } else {
+          localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));
+          log('Reusing local stream', 'success');
         }
-      };
-
-      ws.onerror = function (evt) {
-        console.log('WebSocket error:', evt);
-      };
-
-      return ws;
-    }
-
-    // Функция для повторного подключения
-    function reconnect() {
-      setTimeout(() => {
-        console.log('Attempting to reconnect...');
-        initConnection();
-      }, 1000);
-    }
-
-    // Основная функция для инициализации соединения
-    function initConnection() {
-      let pc = initPeerConnection();
-      let ws = setupWebSocket(pc);
-
-      // Запрашиваем доступ к камере/микрофону, но делаем это опциональным
-      navigator.mediaDevices
-        .getUserMedia({ video: true, audio: true })
-        .then((stream) => {
-          document.getElementById('localVideo').srcObject = stream;
-          stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-          console.log('Local stream added');
-        })
-        .catch((e) => {
-          console.log('No local stream available (camera/microphone disabled):', e);
-        });
-    }
-
-    // Запускаем соединение
-    initConnection();
-  </script>
+      }
+    </script>
+  </body>
 </html>
