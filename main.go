@@ -75,13 +75,11 @@ func main() {
 		defer listLock.Unlock()
 		for i, conn := range connections {
 			if conn.kws.GetUUID() == ep.Kws.GetUUID() {
-				// Remove all tracks associated with this connection
 				for trackID := range conn.tracks {
 					if _, ok := trackLocals[trackID]; ok {
 						delete(trackLocals, trackID)
 					}
 				}
-				// Close and remove connection
 				if err := conn.pc.Close(); err != nil {
 					log.Errorf("Failed to close PeerConnection: %v", err)
 				}
@@ -89,9 +87,9 @@ func main() {
 				break
 			}
 		}
-		listLock.Unlock() // Unlock before signaling
+		listLock.Unlock()
 		signalPeerConnections()
-		listLock.Lock() // Re-lock for defer
+		listLock.Lock()
 		log.Infof("Disconnected: %s", ep.Kws.GetUUID())
 	})
 
@@ -280,7 +278,6 @@ func addTrack(conn *connection, t *webrtc.TrackRemote) *webrtc.TrackLocalStaticR
 		return nil
 	}
 
-	// Remove old track if exists
 	if oldTrack, exists := trackLocals[t.ID()]; exists {
 		removeTrack(oldTrack)
 	}
