@@ -28,8 +28,9 @@ var (
 	rooms         = make(map[string]*room)
 	logger        *zap.Logger
 	bufferPool    = sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 1500)
+		New: func() any {
+			buf := make([]byte, 1500)
+			return &buf
 		},
 	}
 	serverRunning uint32 = 1
@@ -395,10 +396,11 @@ func setupWebRTCHandlers(conn *connection, r *room, requestID string) {
 						zap.String("request_id", requestID))
 					return
 				default:
-					buf := bufferPool.Get().([]byte)
+					bufPtr := bufferPool.Get().(*[]byte)
+					buf := *bufPtr
 					i, _, err := t.Read(buf)
 					if err != nil {
-						bufferPool.Put(buf)
+						bufferPool.Put(bufPtr)
 						if err == io.EOF {
 							logger.Info("Track closed",
 								zap.String("track_id", t.ID()),
@@ -412,7 +414,7 @@ func setupWebRTCHandlers(conn *connection, r *room, requestID string) {
 						return
 					}
 					if err = rtpPkt.Unmarshal(buf[:i]); err != nil {
-						bufferPool.Put(buf)
+						bufferPool.Put(bufPtr)
 						logger.Error("Failed to unmarshal RTP packet",
 							zap.Error(err),
 							zap.String("track_id", t.ID()),
@@ -422,14 +424,14 @@ func setupWebRTCHandlers(conn *connection, r *room, requestID string) {
 					rtpPkt.Extension = false
 					rtpPkt.Extensions = nil
 					if err = trackLocal.WriteRTP(rtpPkt); err != nil {
-						bufferPool.Put(buf)
+						bufferPool.Put(bufPtr)
 						logger.Error("Failed to write RTP packet",
 							zap.Error(err),
 							zap.String("track_id", t.ID()),
 							zap.String("request_id", requestID))
 						return
 					}
-					bufferPool.Put(buf)
+					bufferPool.Put(bufPtr)
 				}
 			}
 		}()
@@ -515,7 +517,7 @@ func websocketHandler(ep *socketio.EventPayload) {
 				zap.String("request_id", requestID))
 			return
 		}
-		if err := conn.pc.SetLocalDescription(answer); err != nil {
+		if err = conn.pc.SetLocalDescription(answer); err != nil {
 			logger.Error("Failed to set local description",
 				zap.Error(err),
 				zap.String("request_id", requestID))
